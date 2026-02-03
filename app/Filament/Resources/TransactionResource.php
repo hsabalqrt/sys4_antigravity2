@@ -197,7 +197,14 @@ class TransactionResource extends Resource {
                     ->label('النوع'),
             ])
             ->actions([
-                Tables\Actions\EditAction::make(),
+                Tables\Actions\ActionGroup::make([
+                    Tables\Actions\ViewAction::make()
+                        ->label('عرض'),
+                    Tables\Actions\EditAction::make()
+                        ->label('تعديل'),
+                    Tables\Actions\DeleteAction::make()
+                        ->label('حذف'),
+                ]),
             ])
             ->bulkActions([
                 Tables\Actions\BulkActionGroup::make([

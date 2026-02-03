@@ -304,6 +304,104 @@ class SubscriptionResource extends Resource {
             ])
             ->actions([
                 Tables\Actions\ActionGroup::make([
+                    Tables\Actions\ViewAction::make()
+                        ->label('عرض'),
+                    Tables\Actions\Action::make('record_payment')
+                        ->label('تسديد المبلغ')
+                        ->icon('heroicon-o-banknotes')
+                        ->color('success')
+                        ->visible(fn(Subscription $record) => $record->payment_status !== 'paid')
+                        ->modalHeading('تسجيل سداد مبلغ')
+                        ->modalSubmitActionLabel('تسديد')
+                        ->form([
+                            Forms\Components\Hidden::make('currency_id')
+                                ->default(fn(Subscription $record) => $record->currency_id),
+
+                            Forms\Components\Select::make('paid_currency_id')
+                                ->label('عملة السداد')
+                                ->relationship('currency', 'currency')
+                                ->required()
+                                ->default(fn(Subscription $record) => $record->currency_id)
+                                ->live()
+                                ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set, $state) {
+                                    if (!$state) {
+                                        return;
+                                    }
+                                    $targetCurrencyId = $get('currency_id');
+                                    $rate = self::computeExchangeRate($state, $targetCurrencyId);
+                                    $set('exchange_rate', $rate);
+                                    $amt = self::convertAmount($state, $targetCurrencyId, (float)$get('original_amount'), (float)$rate);
+                                    $set('amount', $amt);
+                                }),
+
+                            Forms\Components\TextInput::make('exchange_rate')
+                                ->label('سعر الصرف')
+                                ->numeric()
+                                ->required()
+                                ->default(1)
+                                ->live(onBlur: true)
+                                ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                                    $statePay = $get('paid_currency_id');
+                                    $targetId = $get('currency_id');
+                                    $amt = self::convertAmount($statePay, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                    $set('amount', $amt);
+                                }),
+
+                            Forms\Components\TextInput::make('original_amount')
+                                ->label('المبلغ بالعملة المدفوعة')
+                                ->numeric()
+                                ->required()
+                                ->default(fn(Subscription $record) => $record->payment_amount - $record->transactions()->where('type', 'credit')->sum('amount'))
+                                ->live(onBlur: true)
+                                ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                                    $statePay = $get('paid_currency_id');
+                                    $targetId = $get('currency_id');
+                                    $amt = self::convertAmount($statePay, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                    $set('amount', $amt);
+                                }),
+
+                            Forms\Components\TextInput::make('amount')
+                                ->label('المبلغ الصافي (بعملة الاشتراك)')
+                                ->numeric()
+                                ->required()
+                                ->readOnly()
+                                ->helperText(fn(Forms\Get $get) => self::conversionHint($get('paid_currency_id'), $get('currency_id'))),
+
+                            Forms\Components\DatePicker::make('payment_date')
+                                ->label('تاريخ السداد')
+                                ->default(now())
+                                ->required(),
+
+                            Forms\Components\TextInput::make('note')
+                                ->label('ملاحظات')
+                                ->columnSpanFull(),
+
+                            Forms\Components\Select::make('payment_gateway')
+                                ->label('طريقة السداد')
+                                ->options([
+                                    'cash' => 'كاش',
+                                    'transfer' => 'حوالة',
+                                ])
+                                ->default('cash')
+                                ->required()
+                                ->live(),
+
+                            Forms\Components\TextInput::make('transfer_number')
+                                ->label('رقم الحوالة')
+                                ->visible(fn(Forms\Get $get) => $get('payment_gateway') === 'transfer')
+                                ->required(fn(Forms\Get $get) => $get('payment_gateway') === 'transfer'),
+                        ])
+                        ->action(function (array $data, Subscription $record): void {
+                            $payload = self::buildTransactionPayload(
+                                $record,
+                                $data,
+                                'تسديد مبلغ اشتراك: ' . self::subscriptionTypeLabel($record->subscription_type),
+                                amountKey: 'amount',
+                                type: 'credit'
+                            );
+                            $record->transactions()->create($payload);
+                        }),
+
                     Tables\Actions\EditAction::make()
                         ->label('تعديل'),
                     Tables\Actions\Action::make('renew')
@@ -315,9 +413,9 @@ class SubscriptionResource extends Resource {
                             fn(Subscription $record) =>
                             $record->payment_type === 'deferred' && $record->balance < 0 // Block postpaid renewal if debt exists
                         )
-                        ->requiresConfirmation(fn(Subscription $record) => $record->payment_type === 'deferred' && $record->balance < 0)
-                        ->modalHeading('تنبيه مديونية')
-                        ->modalDescription('هذا العميل لديه مديونية مستحقة. يرجى تحصيل المبالغ قبل التجديد.')
+                        // ->requiresConfirmation(fn(Subscription $record) => $record->payment_type === 'deferred' && $record->balance < 0)
+                        // ->modalHeading('تنبيه مديونية')
+                        // ->modalDescription('هذا العميل لديه مديونية مستحقة. يرجى تحصيل المبالغ قبل التجديد.')
                         ->action(fn(Subscription $record) => redirect(SubscriptionResource::getUrl('create', [
                             'client_id' => $record->client_id,
                             'designs_count' => $record->designs_count,

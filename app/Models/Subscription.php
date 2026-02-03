@@ -26,8 +26,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
  * @property \Illuminate\Support\Carbon|null $created_at
  * @property \Illuminate\Support\Carbon|null $updated_at
  */
-class Subscription extends Model
-{
+class Subscription extends Model {
     use HasFactory;
 
     /**
@@ -66,24 +65,21 @@ class Subscription extends Model
     /**
      * يحدد علاقة "ينتمي إلى" (belongsTo) مع العميل (Client).
      */
-    public function client(): BelongsTo
-    {
+    public function client(): BelongsTo {
         return $this->belongsTo(Client::class);
     }
 
     /**
      * يحدد علاقة "ينتمي إلى" (belongsTo) مع العملة (Currency).
      */
-    public function currency(): BelongsTo
-    {
+    public function currency(): BelongsTo {
         return $this->belongsTo(Currency::class);
     }
 
     /**
      * يحدد علاقة "ينتمي إلى العديد" (belongsToMany) مع الوسوم (Tags).
      */
-    public function tags(): BelongsToMany
-    {
+    public function tags(): BelongsToMany {
         return $this->belongsToMany(Tag::class, 'subscription_tags');
     }
     /**
@@ -98,8 +94,7 @@ class Subscription extends Model
     /**
      * حساب الأيام المتبقية.
      */
-    public function getDaysRemainingAttribute()
-    {
+    public function getDaysRemainingAttribute() {
         if (! $this->end_date) {
             return 30;
         } // Default safe margin if not calculated
@@ -110,8 +105,7 @@ class Subscription extends Model
     /**
      * حساب الحالة بناءً على التواريخ (للاستخدام الداخلي أو التحديث).
      */
-    public function calculateStatus(): string
-    {
+    public function calculateStatus(): string {
         $days = $this->days_remaining;
 
         if ($days < 0) {
@@ -127,8 +121,7 @@ class Subscription extends Model
     /**
      * تشغيل العمليات عند حفظ النموذج.
      */
-    protected static function booted()
-    {
+    protected static function booted() {
         static::saving(function ($subscription) {
             // تلقائياً حساب تاريخ الانتهاء إذا تم تعديل تاريخ البدء أو النوع (ولم يتم تعديل تاريخ الانتهاء يدوياً)، أو إذا كان مفقوداً
             $shouldUpdateEndDate = (! $subscription->end_date) ||
@@ -148,8 +141,7 @@ class Subscription extends Model
     /**
      * حساب تاريخ الانتهاء بناءً على تاريخ البدء ونوع الاشتراك.
      */
-    public static function calculateEndDateFrom($startDate = null, $type = 'monthly'): \Illuminate\Support\Carbon
-    {
+    public static function calculateEndDateFrom($startDate = null, $type = 'monthly'): \Illuminate\Support\Carbon {
         $start = $startDate ? \Illuminate\Support\Carbon::parse($startDate) : now();
 
         return match ($type) {
@@ -162,8 +154,7 @@ class Subscription extends Model
     /**
      * إضافة رسوم اشتراك تلقائياً في كشف الحساب.
      */
-    public function generateDebitTransaction()
-    {
+    public function generateDebitTransaction() {
         // إذا كان الدفع آجلاً (deferred)، لا يتم إنشاء قيد استحقاق عند الإنشاء (يتم عبر وظيفة يومية)
         if ($this->payment_type === 'deferred') {
             return null;
@@ -189,8 +180,7 @@ class Subscription extends Model
     /**
      * إضافة سداد تلقائي في كشف الحساب.
      */
-    public function generateCreditTransaction()
-    {
+    public function generateCreditTransaction() {
         return Transaction::create([
             'client_id' => $this->client_id,
             'subscription_id' => $this->id,
@@ -207,27 +197,25 @@ class Subscription extends Model
     /**
      * يمثل علاقة "لديه العديد" (hasMany) مع المعاملات (Transactions).
      */
-    public function transactions(): \Illuminate\Database\Eloquent\Relations\HasMany
-    {
+    public function transactions(): \Illuminate\Database\Eloquent\Relations\HasMany {
         return $this->hasMany(Transaction::class);
     }
 
     /**
      * حساب رصيد الاشتراك.
      */
-    public function getBalanceAttribute(): float
-    {
-        $credits = $this->transactions()->where('type', 'credit')->sum('amount');
-        $debits = $this->transactions()->where('type', 'debit')->sum('amount');
+    public function getBalanceAttribute(): float {
+        $credits = (float) $this->transactions()->where('type', 'credit')->sum('amount');
+        $debits = (float) $this->transactions()->where('type', 'debit')->sum('amount');
 
-        return $credits - $debits;
+        // Round to 2 decimals to avoid tiny floating errors
+        return round($credits - $debits, 2);
     }
 
     /**
      * الحصول على حالة السداد.
      */
-    public function getPaymentStatusAttribute(): string
-    {
+    public function getPaymentStatusAttribute(): string {
         $paid = $this->transactions()->where('type', 'credit')->sum('amount');
 
         if ($paid <= 0) {
