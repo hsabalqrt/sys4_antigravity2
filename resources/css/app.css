@@ -1,0 +1,42 @@
+@import '../../vendor/alperenersoy/filament-export/resources/css/filament-export.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+Description: Global Scrollbar Customization
+Inputs/Key Variables: ::-webkit-scrollbar related pseudo-elements
+Outputs/Effect: Applies a modern, thin scrollbar style that adapts to light and dark modes.
+*/
+::-webkit-scrollbar {
+    width: 12px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background-color: #9ca3af;
+    /* gray-400 */
+    border-radius: 20px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background-color: #6b7280;
+    /* gray-500 */
+}
+
+.dark ::-webkit-scrollbar-thumb {
+    background-color: #441188;
+    /* gray-600 */
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+    background-color: #ff6600;
+    /* gray-500 */
+}
