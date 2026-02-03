@@ -3,6 +3,7 @@
 namespace App\Filament\Resources\ClientResource\RelationManagers;
 
 use App\Filament\Enums\SubscriptionType;
+use App\Filament\Traits\PaymentFormHelpers;
 use App\Models\Subscription;
 use Filament\Forms;
 use Filament\Forms\Components\DatePicker;
@@ -20,8 +21,8 @@ use Filament\Infolists\Infolist;
 use Filament\Infolists\Components\TextEntry;
 use Filament\Infolists\Components\RepeatableEntry;
 
-class SubscriptionsRelationManager extends RelationManager
-{
+class SubscriptionsRelationManager extends RelationManager {
+    use PaymentFormHelpers;
     protected static string $relationship = 'subscriptions';
 
     protected static ?string $label = 'الباقات';
@@ -37,8 +38,7 @@ class SubscriptionsRelationManager extends RelationManager
     protected static ?string $modelLabel = 'الباقة';
 
 
-    public static function updateEndDate(Forms\Set $set, Forms\Get $get)
-    {
+    public static function updateEndDate(Forms\Set $set, Forms\Get $get) {
         $startDate = $get('start_date');
         $type = $get('subscription_type');
 
@@ -51,8 +51,7 @@ class SubscriptionsRelationManager extends RelationManager
         $set('end_date', $endDate->format('Y-m-d'));
     }
 
-    public function getSubscriptionFormSchema(?Subscription $record = null): array
-    {
+    public function getSubscriptionFormSchema(?Subscription $record = null): array {
         return [
             Forms\Components\Grid::make(2)
                 ->schema([
@@ -180,21 +179,15 @@ class SubscriptionsRelationManager extends RelationManager
                                 ->default(fn(Forms\Get $get) => $get('currency_id'))
                                 ->live()
                                 ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set, $state) {
-                                    if ($state) {
-                                        $paymentCur = \App\Models\Currency::find($state);
-                                        $targetCurrencyId = $get('currency_id');
-                                        $targetCur = \App\Models\Currency::find($targetCurrencyId);
-
-                                        if ($paymentCur && $targetCur) {
-                                            if ($paymentCur->id == $targetCur->id) {
-                                                $set('exchange_rate', 1);
-                                            } else {
-                                                $rate = max($paymentCur->value, $targetCur->value) / min($paymentCur->value, $targetCur->value);
-                                                $set('exchange_rate', round($rate, 2));
-                                            }
-                                            static::calculateAmount($get, $set);
-                                        }
+                                    if (!$state) {
+                                        return;
                                     }
+                                    $targetCurrencyId = $get('currency_id');
+                                    $rate = self::computeExchangeRate($state, $targetCurrencyId);
+                                    $set('exchange_rate', $rate);
+                                    $amt = self::convertAmount($state, $targetCurrencyId, (float)$get('original_amount'), (float)$rate);
+                                    $set('paid_amount', $amt);
+                                    $set('amount', $amt);
                                 }),
 
                             Forms\Components\TextInput::make('exchange_rate')
@@ -203,7 +196,13 @@ class SubscriptionsRelationManager extends RelationManager
                                 ->required()
                                 ->default(1)
                                 ->live(onBlur: true)
-                                ->afterStateUpdated(fn(Forms\Get $get, Forms\Set $set) => static::calculateAmount($get, $set)),
+                                ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                                    $statePay = $get('paid_currency_id');
+                                    $targetId = $get('currency_id');
+                                    $amt = self::convertAmount($statePay, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                    $set('paid_amount', $amt);
+                                    $set('amount', $amt);
+                                }),
 
                             Forms\Components\TextInput::make('original_amount')
                                 ->label('المبلغ بالعملة المدفوعة')
@@ -211,14 +210,20 @@ class SubscriptionsRelationManager extends RelationManager
                                 ->required()
                                 ->default(fn(Forms\Get $get) => $get('payment_amount'))
                                 ->live(onBlur: true)
-                                ->afterStateUpdated(fn(Forms\Get $get, Forms\Set $set) => static::calculateAmount($get, $set)),
+                                ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                                    $statePay = $get('paid_currency_id');
+                                    $targetId = $get('currency_id');
+                                    $amt = self::convertAmount($statePay, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                    $set('paid_amount', $amt);
+                                    $set('amount', $amt);
+                                }),
 
                             Forms\Components\TextInput::make('paid_amount')
                                 ->label('المبلغ الصافي (بعملة الاشتراك)')
                                 ->numeric()
                                 ->required()
                                 ->readOnly()
-                                ->helperText(fn(Forms\Get $get) => static::getConversionLabel($get)),
+                                ->helperText(fn(Forms\Get $get) => self::conversionHint($get('paid_currency_id'), $get('currency_id'))),
 
                             Forms\Components\DatePicker::make('payment_date')
                                 ->label('تاريخ السداد')
@@ -251,13 +256,11 @@ class SubscriptionsRelationManager extends RelationManager
         ];
     }
 
-    public function form(Form $form): Form
-    {
+    public function form(Form $form): Form {
         return $form->schema($this->getSubscriptionFormSchema())->columns(2);
     }
 
-    public function table(Table $table): Table
-    {
+    public function table(Table $table): Table {
         return $table
             ->recordTitleAttribute('subscription_type')
             ->columns([
@@ -346,7 +349,9 @@ class SubscriptionsRelationManager extends RelationManager
                                 'type' => 'credit',
                                 'payment_gateway' => $data['payment_gateway'] ?? 'cash',
                                 'transfer_number' => $data['transfer_number'] ?? null,
-                                'description' => $data['payment_note'] ?? ('سداد مقدم للاشتراك: ' . $record->subscription_type->getLabel()),
+                                'description' => $data['payment_note'] ?? (
+                                    'سداد مقدم للاشتراك: ' . self::subscriptionTypeLabel($record->subscription_type)
+                                ),
                                 'transaction_date' => $data['payment_date'] ?? now(),
                             ]);
                         }
@@ -373,21 +378,14 @@ class SubscriptionsRelationManager extends RelationManager
                                 ->default(fn(Subscription $record) => $record->currency_id)
                                 ->live()
                                 ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set, $state) {
-                                    if ($state) {
-                                        $paymentCur = \App\Models\Currency::find($state);
-                                        $targetCurrencyId = $get('currency_id');
-                                        $targetCur = \App\Models\Currency::find($targetCurrencyId);
-
-                                        if ($paymentCur && $targetCur) {
-                                            if ($paymentCur->id == $targetCur->id) {
-                                                $set('exchange_rate', 1);
-                                            } else {
-                                                $rate = max($paymentCur->value, $targetCur->value) / min($paymentCur->value, $targetCur->value);
-                                                $set('exchange_rate', round($rate, 2));
-                                            }
-                                            static::calculateAmount($get, $set);
-                                        }
+                                    if (!$state) {
+                                        return;
                                     }
+                                    $targetCurrencyId = $get('currency_id');
+                                    $rate = self::computeExchangeRate($state, $targetCurrencyId);
+                                    $set('exchange_rate', $rate);
+                                    $amt = self::convertAmount($state, $targetCurrencyId, (float)$get('original_amount'), (float)$rate);
+                                    $set('amount', $amt);
                                 }),
 
                             Forms\Components\TextInput::make('exchange_rate')
@@ -396,7 +394,12 @@ class SubscriptionsRelationManager extends RelationManager
                                 ->required()
                                 ->default(1)
                                 ->live(onBlur: true)
-                                ->afterStateUpdated(fn(Forms\Get $get, Forms\Set $set) => static::calculateAmount($get, $set)),
+                                ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                                    $statePay = $get('paid_currency_id');
+                                    $targetId = $get('currency_id');
+                                    $amt = self::convertAmount($statePay, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                    $set('amount', $amt);
+                                }),
 
                             Forms\Components\TextInput::make('original_amount')
                                 ->label('المبلغ بالعملة المدفوعة')
@@ -404,14 +407,19 @@ class SubscriptionsRelationManager extends RelationManager
                                 ->required()
                                 ->default(fn(Subscription $record) => $record->payment_amount - $record->transactions()->where('type', 'credit')->sum('amount'))
                                 ->live(onBlur: true)
-                                ->afterStateUpdated(fn(Forms\Get $get, Forms\Set $set) => static::calculateAmount($get, $set)),
+                                ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                                    $statePay = $get('paid_currency_id');
+                                    $targetId = $get('currency_id');
+                                    $amt = self::convertAmount($statePay, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                    $set('amount', $amt);
+                                }),
 
                             Forms\Components\TextInput::make('amount')
                                 ->label('المبلغ الصافي (بعملة الاشتراك)')
                                 ->numeric()
                                 ->required()
                                 ->readOnly()
-                                ->helperText(fn(Forms\Get $get) => static::getConversionLabel($get)),
+                                ->helperText(fn(Forms\Get $get) => self::conversionHint($get('paid_currency_id'), $get('currency_id'))),
 
                             Forms\Components\DatePicker::make('payment_date')
                                 ->label('تاريخ السداد')
@@ -447,7 +455,9 @@ class SubscriptionsRelationManager extends RelationManager
                                 'type' => 'credit',
                                 'payment_gateway' => $data['payment_gateway'] ?? 'cash',
                                 'transfer_number' => $data['transfer_number'] ?? null,
-                                'description' => $data['note'] ?? ('تسديد مبلغ اشتراك: ' . $record->subscription_type->getLabel()),
+                                'description' => $data['note'] ?? (
+                                    'تسديد مبلغ اشتراك: ' . self::subscriptionTypeLabel($record->subscription_type)
+                                ),
                                 'transaction_date' => $data['payment_date'],
                             ]);
                             Notification::make()
@@ -501,7 +511,7 @@ class SubscriptionsRelationManager extends RelationManager
                                     'type' => 'credit',
                                     'payment_gateway' => $data['payment_gateway'] ?? 'cash',
                                     'transfer_number' => $data['transfer_number'] ?? null,
-                                    'description' => $paymentNote ?? ('سداد تجديد اشتراك: ' . $newSubscription->subscription_type->getLabel()),
+                                    'description' => $paymentNote ?? ('سداد تجديد اشتراك: ' . self::subscriptionTypeLabel($newSubscription->subscription_type)),
                                     'transaction_date' => $paymentDate ?? now(),
                                 ]);
                             }
@@ -541,8 +551,7 @@ class SubscriptionsRelationManager extends RelationManager
      * @param  \Filament\Infolists\Infolist  $infolist قائمة معلومات Filament.
      * @return \Filament\Infolists\Infolist قائمة المعلومات المعرفة.
      */
-    public function infolist(Infolist $infolist): Infolist
-    {
+    public function infolist(Infolist $infolist): Infolist {
         return $infolist
             ->schema([
                 Fieldset::make('تفاصيل الاشتراك')
@@ -621,8 +630,7 @@ class SubscriptionsRelationManager extends RelationManager
 
             ]);
     }
-    protected static function calculateAmount(Forms\Get $get, Forms\Set $set): void
-    {
+    protected static function calculateAmount(Forms\Get $get, Forms\Set $set): void {
         $originalAmount = (float) $get('original_amount');
         $exchangeRate = (float) $get('exchange_rate');
         $paymentCurrencyId = $get('paid_currency_id');
@@ -656,8 +664,7 @@ class SubscriptionsRelationManager extends RelationManager
         $set('amount', $calculatedAmount); // For record_payment modal
     }
 
-    protected static function getConversionLabel(Forms\Get $get): string
-    {
+    protected static function getConversionLabel(Forms\Get $get): string {
         $paymentCurrencyId = $get('paid_currency_id');
         $targetCurrencyId = $get('currency_id');
 
@@ -681,5 +688,16 @@ class SubscriptionsRelationManager extends RelationManager
         }
 
         return "سيتم (ضرب) المبلغ في سعر الصرف للتحويل من {$paymentCur->currency} إلى {$targetCur->currency}";
+    }
+
+    protected static function subscriptionTypeLabel($type): string {
+        if (is_object($type) && method_exists($type, 'getLabel')) {
+            return (string) $type->getLabel();
+        }
+        if (is_string($type) || is_int($type)) {
+            $from = \App\Filament\Enums\SubscriptionType::tryFrom($type);
+            return $from?->getLabel() ?? (string) $type;
+        }
+        return (string) $type;
     }
 }

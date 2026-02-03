@@ -6,6 +6,7 @@ use App\Filament\Resources\SubscriptionResource\Pages;
 use App\Models\Subscription;
 use App\Models\Currency;
 use App\Models\Client;
+use App\Filament\Traits\PaymentFormHelpers;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Resources\Resource;
@@ -13,14 +14,13 @@ use Filament\Tables;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 
-class SubscriptionResource extends Resource
-{
+class SubscriptionResource extends Resource {
+    use PaymentFormHelpers;
     protected static ?string $model = Subscription::class;
 
     protected static ?string $navigationIcon = 'heroicon-o-rectangle-stack';
 
-    public static function updateEndDate(Forms\Set $set, Forms\Get $get)
-    {
+    public static function updateEndDate(Forms\Set $set, Forms\Get $get) {
         $startDate = $get('start_date');
         $type = $get('subscription_type');
 
@@ -33,8 +33,7 @@ class SubscriptionResource extends Resource
         $set('end_date', $endDate->format('Y-m-d'));
     }
 
-    public static function form(Form $form): Form
-    {
+    public static function form(Form $form): Form {
         return $form
             ->schema([
                 Forms\Components\Select::make('client_id')
@@ -143,26 +142,86 @@ class SubscriptionResource extends Resource
 
                 Forms\Components\Section::make('تفاصيل السداد')
                     ->schema([
-                        Forms\Components\TextInput::make('paid_amount')
-                            ->label('المبلغ المدفوع')
+                        Forms\Components\Select::make('paid_currency_id')
+                            ->label('عملة السداد')
+                            ->relationship('currency', 'currency')
+                            ->required()
+                            ->default(fn(Forms\Get $get) => $get('currency_id'))
+                            ->live()
+                            ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set, $state) {
+                                if (!$state) {
+                                    return;
+                                }
+                                $targetCurrencyId = $get('currency_id');
+                                $rate = self::computeExchangeRate($state, $targetCurrencyId);
+                                $set('exchange_rate', $rate);
+                                $amt = self::convertAmount($state, $targetCurrencyId, (float)$get('original_amount'), (float)$rate);
+                                $set('paid_amount', $amt);
+                            }),
+
+                        Forms\Components\TextInput::make('exchange_rate')
+                            ->label('سعر الصرف')
                             ->numeric()
+                            ->required()
+                            ->default(1)
+                            ->live(onBlur: true)
+                            ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                                $statePay = $get('paid_currency_id');
+                                $targetId = $get('currency_id');
+                                $amt = self::convertAmount($statePay, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                $set('paid_amount', $amt);
+                            }),
+
+                        Forms\Components\TextInput::make('original_amount')
+                            ->label('المبلغ بالعملة المدفوعة')
+                            ->numeric()
+                            ->required()
                             ->default(fn(Forms\Get $get) => $get('payment_amount'))
-                            ->required(),
+                            ->live(onBlur: true)
+                            ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                                $statePay = $get('paid_currency_id');
+                                $targetId = $get('currency_id');
+                                $amt = self::convertAmount($statePay, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                $set('paid_amount', $amt);
+                            }),
+
+                        Forms\Components\TextInput::make('paid_amount')
+                            ->label('المبلغ الصافي (بعملة الاشتراك)')
+                            ->numeric()
+                            ->required()
+                            ->readOnly()
+                            ->helperText(fn(Forms\Get $get) => self::conversionHint($get('paid_currency_id'), $get('currency_id'))),
+
                         Forms\Components\DatePicker::make('payment_date')
                             ->label('تاريخ السداد')
                             ->default(now())
                             ->required(),
+
                         Forms\Components\TextInput::make('payment_note')
                             ->label('ملاحظات السداد')
                             ->columnSpanFull(),
+
+                        Forms\Components\Select::make('payment_gateway')
+                            ->label('طريقة السداد')
+                            ->options([
+                                'cash' => 'كاش',
+                                'transfer' => 'حوالة',
+                            ])
+                            ->default('cash')
+                            ->required()
+                            ->live(),
+
+                        Forms\Components\TextInput::make('transfer_number')
+                            ->label('رقم الحوالة')
+                            ->visible(fn(Forms\Get $get) => $get('payment_gateway') === 'transfer')
+                            ->required(fn(Forms\Get $get) => $get('payment_gateway') === 'transfer'),
                     ])
                     ->visible(fn(Forms\Get $get) => $get('is_paid_now'))
                     ->columns(2),
             ]);
     }
 
-    public static function table(Table $table): Table
-    {
+    public static function table(Table $table): Table {
         return $table
             ->columns([
                 Tables\Columns\TextColumn::make('client.company')
@@ -190,6 +249,22 @@ class SubscriptionResource extends Resource
                         'advance' => 'success',
                         'deferred' => 'warning',
                     }),
+
+                Tables\Columns\TextColumn::make('payment_status')
+                    ->label('حالة السداد')
+                    ->badge()
+                    ->color(fn(string $state): string => match ($state) {
+                        'paid' => 'success',
+                        'unpaid' => 'danger',
+                        'partial' => 'warning',
+                        default => 'gray',
+                    })
+                    ->formatStateUsing(fn(string $state, Subscription $record): string => match ($state) {
+                        'paid' => 'تم السداد',
+                        'unpaid' => 'لم يتم السداد',
+                        'partial' => 'متبقي عليه مديونية: ' . number_format(abs($record->balance), 2) . ($record->currency->currency ?? '$'),
+                        default => 'غير محدد',
+                    }),
                 Tables\Columns\TextColumn::make('status')
                     ->label('الحالة')
                     ->badge()
@@ -211,7 +286,7 @@ class SubscriptionResource extends Resource
 
                 Tables\Columns\TextColumn::make('payment_amount')
                     ->label('المبلغ')
-                    ->money(fn($record) => $record->currency->symbol ?? 'USD', locale: 'en')
+                    ->money(fn($record) => $record->currency->currency ?? 'USD', locale: 'en')
                     ->sortable(),
 
                 Tables\Columns\TextColumn::make('start_date')
@@ -223,6 +298,7 @@ class SubscriptionResource extends Resource
                     ->date()
                     ->sortable(),
             ])
+            ->defaultSort('id', 'desc')
             ->filters([
                 //
             ])
@@ -245,7 +321,9 @@ class SubscriptionResource extends Resource
                         ->action(fn(Subscription $record) => redirect(SubscriptionResource::getUrl('create', [
                             'client_id' => $record->client_id,
                             'designs_count' => $record->designs_count,
-                            'subscription_type' => $record->subscription_type,
+                            'subscription_type' => (is_object($record->subscription_type) && property_exists($record->subscription_type, 'value'))
+                                ? $record->subscription_type->value
+                                : (string) $record->subscription_type,
                             'payment_amount' => $record->payment_amount,
                             'currency_id' => $record->currency_id,
                         ]))),
@@ -272,15 +350,13 @@ class SubscriptionResource extends Resource
             ]);
     }
 
-    public static function getRelations(): array
-    {
+    public static function getRelations(): array {
         return [
             //
         ];
     }
 
-    public static function getPages(): array
-    {
+    public static function getPages(): array {
         return [
             'index' => Pages\ListSubscriptions::route('/'),
             'create' => Pages\CreateSubscription::route('/create'),

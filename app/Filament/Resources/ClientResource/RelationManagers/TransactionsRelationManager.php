@@ -3,6 +3,7 @@
 namespace App\Filament\Resources\ClientResource\RelationManagers;
 
 use App\Filament\Enums\SubscriptionType;
+use App\Filament\Traits\PaymentFormHelpers;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Resources\RelationManagers\RelationManager;
@@ -11,14 +12,13 @@ use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 
-class TransactionsRelationManager extends RelationManager
-{
+class TransactionsRelationManager extends RelationManager {
+    use PaymentFormHelpers;
     protected static string $relationship = 'transactions';
 
     protected static ?string $title = 'سجل المعاملات المالية';
 
-    public function form(Form $form): Form
-    {
+    public function form(Form $form): Form {
         return $form
             ->schema([
                 Forms\Components\Grid::make(2)
@@ -44,7 +44,7 @@ class TransactionsRelationManager extends RelationManager
                                     ->get()
                                     ->sortByDesc('created_at')
                                     ->mapWithKeys(function ($subscription) {
-                                        $name = $subscription->subscription_type->getLabel();
+                                        $name = self::subscriptionTypeLabel($subscription->subscription_type);
                                         $amount = $subscription->payment_amount;
                                         $currency = $subscription->currency->currency;
                                         $endDate = $subscription->end_date->format('Y-m-d');
@@ -99,42 +99,49 @@ class TransactionsRelationManager extends RelationManager
                             ->required()
                             ->live()
                             ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set, $state, RelationManager $livewire) {
-                                if ($state) {
-                                    $paymentCur = \App\Models\Currency::find($state);
-                                    $subscriptionId = $get('subscription_id');
-                                    $targetCurrencyId = $subscriptionId
-                                        ? \App\Models\Subscription::find($subscriptionId)?->currency_id
-                                        : $livewire->getOwnerRecord()->currency_id;
-
-                                    $targetCur = \App\Models\Currency::find($targetCurrencyId);
-
-                                    if ($paymentCur && $targetCur) {
-                                        if ($paymentCur->id == $targetCur->id) {
-                                            $set('exchange_rate', 1);
-                                        } else {
-                                            // Smart Default: Calculate relative rate (e.g. 530 / 1 = 530)
-                                            $rate = max($paymentCur->value, $targetCur->value) / min($paymentCur->value, $targetCur->value);
-                                            $set('exchange_rate', round($rate, 2));
-                                        }
-                                        static::calculateAmount($get, $set, $livewire);
-                                    }
+                                if (!$state) {
+                                    return;
                                 }
+                                $subscriptionId = $get('subscription_id');
+                                $targetCurrencyId = $subscriptionId
+                                    ? \App\Models\Subscription::find($subscriptionId)?->currency_id
+                                    : $livewire->getOwnerRecord()->currency_id;
+                                $rate = self::computeExchangeRate($state, $targetCurrencyId);
+                                $set('exchange_rate', $rate);
+                                $amt = self::convertAmount($state, $targetCurrencyId, (float)$get('original_amount'), (float)$rate);
+                                $set('amount', $amt);
                             }),
 
                         Forms\Components\TextInput::make('exchange_rate')
                             ->label('سعر الصرف')
                             ->numeric()
                             ->required()
-                            ->default(fn($get) => \App\Models\Currency::where('id', $get('currency_id'))->first()->value ?? 1)
+                            ->default(1)
                             ->live(onBlur: true)
-                            ->afterStateUpdated(fn(Forms\Get $get, Forms\Set $set, RelationManager $livewire) => static::calculateAmount($get, $set, $livewire)),
+                            ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set, RelationManager $livewire) {
+                                $payId = $get('currency_id');
+                                $subscriptionId = $get('subscription_id');
+                                $targetId = $subscriptionId
+                                    ? \App\Models\Subscription::find($subscriptionId)?->currency_id
+                                    : $livewire->getOwnerRecord()->currency_id;
+                                $amt = self::convertAmount($payId, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                $set('amount', $amt);
+                            }),
 
                         Forms\Components\TextInput::make('original_amount')
                             ->label('المبلغ بالعملة المدفوعة')
                             ->numeric()
                             ->required()
                             ->live(onBlur: true)
-                            ->afterStateUpdated(fn(Forms\Get $get, Forms\Set $set, RelationManager $livewire) => static::calculateAmount($get, $set, $livewire)),
+                            ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set, RelationManager $livewire) {
+                                $payId = $get('currency_id');
+                                $subscriptionId = $get('subscription_id');
+                                $targetId = $subscriptionId
+                                    ? \App\Models\Subscription::find($subscriptionId)?->currency_id
+                                    : $livewire->getOwnerRecord()->currency_id;
+                                $amt = self::convertAmount($payId, $targetId, (float)$get('original_amount'), (float)$get('exchange_rate'));
+                                $set('amount', $amt);
+                            }),
 
                         Forms\Components\TextInput::make('amount')
                             ->label('المبلغ الصافي (بعملة الاشتراك)')
@@ -142,8 +149,7 @@ class TransactionsRelationManager extends RelationManager
                             ->required()
                             ->reactive()
                             ->readOnly()
-
-                            ->helperText(fn(Forms\Get $get, RelationManager $livewire) => static::getConversionLabel($get, $livewire)),
+                            ->helperText(fn(Forms\Get $get, RelationManager $livewire) => self::conversionHint($get('currency_id'), ($get('subscription_id') ? \App\Models\Subscription::find($get('subscription_id'))?->currency_id : $livewire->getOwnerRecord()->currency_id))),
 
                         Forms\Components\Select::make('payment_gateway')
                             ->label('طريقة السداد')
@@ -168,8 +174,7 @@ class TransactionsRelationManager extends RelationManager
             ]);
     }
 
-    public function table(Table $table): Table
-    {
+    public function table(Table $table): Table {
         return $table
             ->recordTitleAttribute('description')
             ->columns([
@@ -272,8 +277,7 @@ class TransactionsRelationManager extends RelationManager
             ]);
     }
 
-    protected static function calculateAmount(Forms\Get $get, Forms\Set $set, RelationManager $livewire): void
-    {
+    protected static function calculateAmount(Forms\Get $get, Forms\Set $set, RelationManager $livewire): void {
         $originalAmount = (float) $get('original_amount');
         $exchangeRate = (float) $get('exchange_rate');
         $paymentCurrencyId = $get('currency_id');
@@ -315,8 +319,7 @@ class TransactionsRelationManager extends RelationManager
         }
     }
 
-    protected static function getConversionLabel(Forms\Get $get, RelationManager $livewire): string
-    {
+    protected static function getConversionLabel(Forms\Get $get, RelationManager $livewire): string {
         $paymentCurrencyId = $get('currency_id');
         $subscriptionId = $get('subscription_id');
 

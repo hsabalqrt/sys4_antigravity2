@@ -12,19 +12,19 @@ use Filament\Tables\Table;
 use App\Models\Client;
 use App\Models\Subscription;
 use App\Models\Currency;
+use App\Filament\Traits\PaymentFormHelpers;
 use Filament\Forms\Get;
 use Filament\Forms\Set;
 use Illuminate\Database\Eloquent\Builder;
 
-class TransactionResource extends Resource
-{
+class TransactionResource extends Resource {
+    use PaymentFormHelpers;
     protected static ?string $model = Transaction::class;
 
     protected static ?string $navigationIcon = 'heroicon-o-banknotes';
     protected static ?string $navigationGroup = 'Sales';
 
-    public static function form(Form $form): Form
-    {
+    public static function form(Form $form): Form {
         return $form
             ->schema([
                 Forms\Components\Section::make()
@@ -50,20 +50,23 @@ class TransactionResource extends Resource
                                 return Subscription::where('client_id', $clientId)
                                     ->get()
                                     ->mapWithKeys(function ($sub) {
-                                        return [$sub->id => "اشتراك #{$sub->id} - {$sub->subscription_type->getLabel()} ({$sub->currency->currency})"];
+                                        $label = self::subscriptionTypeLabel($sub->subscription_type);
+                                        return [$sub->id => "اشتراك #{$sub->id} - {$label} ({$sub->currency->currency})"];
                                     });
                             })
                             ->searchable()
                             ->preload()
                             ->live()
                             ->afterStateUpdated(function (Get $get, Set $set, $state) {
-                                if ($state) {
-                                    $sub = Subscription::with('currency')->find($state);
-                                    if ($sub) {
-                                        $set('currency_id', $sub->currency_id);
-                                        $set('exchange_rate', $sub->currency->value);
-                                        static::calculateAmount($get, $set);
-                                    }
+                                if (!$state) {
+                                    return;
+                                }
+                                $sub = Subscription::with('currency')->find($state);
+                                if ($sub) {
+                                    // Align paid currency to subscription currency; rate = 1
+                                    $set('currency_id', $sub->currency_id);
+                                    $set('exchange_rate', 1);
+                                    $set('amount', self::convertAmount($sub->currency_id, $sub->currency_id, (float)$get('original_amount'), 1));
                                 }
                             }),
 
@@ -92,13 +95,13 @@ class TransactionResource extends Resource
                             ->required()
                             ->live()
                             ->afterStateUpdated(function (Get $get, Set $set, $state) {
-                                if ($state) {
-                                    $currency = Currency::find($state);
-                                    if ($currency) {
-                                        $set('exchange_rate', $currency->value);
-                                        static::calculateAmount($get, $set);
-                                    }
+                                if (!$state) {
+                                    return;
                                 }
+                                $targetId = self::resolveTargetCurrencyId($get('subscription_id'), $get('client_id'));
+                                $rate = self::computeExchangeRate($state, $targetId);
+                                $set('exchange_rate', $rate);
+                                $set('amount', self::convertAmount($state, $targetId, (float)$get('original_amount'), (float)$rate));
                             }),
 
                         Forms\Components\TextInput::make('exchange_rate')
@@ -107,18 +110,24 @@ class TransactionResource extends Resource
                             ->required()
                             ->default(1)
                             ->live()
-                            ->afterStateUpdated(fn(Get $get, Set $set) => static::calculateAmount($get, $set)),
+                            ->afterStateUpdated(function (Get $get, Set $set) {
+                                $targetId = self::resolveTargetCurrencyId($get('subscription_id'), $get('client_id'));
+                                $set('amount', self::convertAmount($get('currency_id'), $targetId, (float)$get('original_amount'), (float)$get('exchange_rate')));
+                            }),
 
                         Forms\Components\TextInput::make('original_amount')
                             ->label('المبلغ بالعملة المدفوعة')
                             ->numeric()
                             ->required()
                             ->live()
-                            ->afterStateUpdated(fn(Get $get, Set $set) => static::calculateAmount($get, $set)),
+                            ->afterStateUpdated(function (Get $get, Set $set) {
+                                $targetId = self::resolveTargetCurrencyId($get('subscription_id'), $get('client_id'));
+                                $set('amount', self::convertAmount($get('currency_id'), $targetId, (float)$get('original_amount'), (float)$get('exchange_rate')));
+                            }),
 
                         Forms\Components\TextInput::make('amount')
                             ->label('المبلغ الصافي (بعملة الاشتراك/العميل)')
-                            ->helperText(fn(Get $get) => static::getConversionLabel($get))
+                            ->helperText(fn(Get $get) => self::conversionHint($get('currency_id'), self::resolveTargetCurrencyId($get('subscription_id'), $get('client_id'))))
                             ->numeric()
                             ->required()
                             ->readOnly(),
@@ -130,8 +139,7 @@ class TransactionResource extends Resource
             ]);
     }
 
-    public static function table(Table $table): Table
-    {
+    public static function table(Table $table): Table {
         return $table
             ->columns([
                 Tables\Columns\TextColumn::make('client.company')
@@ -151,17 +159,19 @@ class TransactionResource extends Resource
                         'debit' => 'خصم',
                     }),
 
+                Tables\Columns\TextColumn::make('subscription.subscription_type')
+                    ->label('الاشتراك')
+                    ->badge(),
+
                 Tables\Columns\TextColumn::make('amount')
                     ->label('المبلغ الصافي')
-                    ->sortable()
-                    ->summarize(
-                        Tables\Columns\Summarizers\Sum::make()
-                            ->label('الإجمالي')
-                    ),
+                    ->color(fn($record) => $record->type === 'credit' ? 'success' : 'danger')
+                    ->money(fn($record) => $record->subscription?->currency?->currency ?? 'USD', locale: 'en')
+                    ->sortable(),
 
                 Tables\Columns\TextColumn::make('original_amount')
                     ->label('المبلغ المدفوع')
-                    ->description(fn($record) => $record->currency?->currency),
+                    ->money(fn($record) => $record->currency?->currency ?? 'USD', locale: 'en'),
 
                 Tables\Columns\TextColumn::make('transaction_date')
                     ->label('التاريخ')
@@ -172,7 +182,7 @@ class TransactionResource extends Resource
                     ->label('الوصف')
                     ->limit(50),
             ])
-            ->defaultSort('created_at', 'desc')
+            ->defaultSort('id', 'desc')
             ->filters([
                 Tables\Filters\SelectFilter::make('client')
                     ->relationship('client', 'company')
@@ -196,8 +206,7 @@ class TransactionResource extends Resource
             ]);
     }
 
-    protected static function calculateAmount(Get $get, Set $set): void
-    {
+    protected static function calculateAmount(Get $get, Set $set): void {
         $originalAmount = (float) $get('original_amount');
         $exchangeRate = (float) $get('exchange_rate');
         $paymentCurrencyId = $get('currency_id');
@@ -240,8 +249,7 @@ class TransactionResource extends Resource
         }
     }
 
-    protected static function getConversionLabel(Get $get): string
-    {
+    protected static function getConversionLabel(Get $get): string {
         $paymentCurrencyId = $get('currency_id');
         $subscriptionId = $get('subscription_id');
         $clientId = $get('client_id');
@@ -275,15 +283,13 @@ class TransactionResource extends Resource
         return "سيتم (ضرب) المبلغ في سعر الصرف للتحويل من {$paymentCur->currency} إلى {$targetCur->currency}";
     }
 
-    public static function getRelations(): array
-    {
+    public static function getRelations(): array {
         return [
             //
         ];
     }
 
-    public static function getPages(): array
-    {
+    public static function getPages(): array {
         return [
             'index' => Pages\ListTransactions::route('/'),
             'create' => Pages\CreateTransaction::route('/create'),
