@@ -261,7 +261,7 @@ class SubscriptionsRelationManager extends RelationManager {
     }
 
     public function table(Table $table): Table {
-        return $table
+        return $table->modifyQueryUsing(fn($query) => $query->with(["currency"]))->modifyQueryUsing(fn($query) => $query->with(["currency"]))
             ->recordTitleAttribute('subscription_type')
             ->columns([
                 Tables\Columns\IconColumn::make('is_main')
